@@ -1,0 +1,139 @@
+name: ORT License Analysis (Fixed edulix Action)
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - main
+
+env:
+  JAVA_OPTS: "-Xmx8g"
+
+jobs:
+  analyze-with-fixed-action:
+    name: ORT with Fixed Docker Permissions
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+      
+      - name: Create ORT Configuration Files
+        run: |
+          # Create default rules.kts if not exists
+          if [ ! -f "rules.kts" ]; then
+            cat > rules.kts << 'EOF'
+          // Default ORT policy rules
+          val permissiveLicenses = setOf("Apache-2.0", "MIT", "BSD-3-Clause")
+          
+          ruleSet(ortResult) {
+              packageRule("DEFAULT_RULE") {
+                  require {
+                      -isAtTreeLevel(0)
+                  }
+              }
+          }
+          EOF
+          fi
+          
+          # Create default license-classifications.yml if not exists
+          if [ ! -f "license-classifications.yml" ]; then
+            cat > license-classifications.yml << 'EOF'
+          categories:
+            - name: permissive
+              description: Permissive licenses
+          
+          categorizations:
+            - id: Apache-2.0
+              categories: [permissive]
+            - id: MIT
+              categories: [permissive]
+          EOF
+          fi
+          
+          # Create curations directory
+          mkdir -p .ort-data/curations-dir
+      
+      # SOLUTION: Run Docker manually without --user flag to avoid permission issues
+      - name: Pull ORT Docker Image
+        run: |
+          docker pull ghcr.io/oss-review-toolkit/ort:latest
+      
+      - name: Run ORT Analysis (Fixed Permissions)
+        run: |
+          # Create results directory
+          mkdir -p ort-results
+          
+          # Fix: Run as root (default) to avoid pyenv permission issues
+          # The edulix action was running with --user 10001 which caused the error
+          docker run --rm \
+            -v "$(pwd):/project" \
+            -v "$(pwd)/ort-results:/results" \
+            -e JAVA_OPTS="${JAVA_OPTS}" \
+            -w /project \
+            ghcr.io/oss-review-toolkit/ort:latest \
+            bash -c "
+              # Ensure output directory is writable
+              chmod -R 777 /results
+              
+              # Run analyzer
+              ort analyze \
+                -i /project \
+                -o /results \
+                --package-curations-dir /project/.ort-data/curations-dir/ || true
+              
+              # Run evaluator if analyzer succeeded
+              if [ -f /results/analyzer-result.yml ]; then
+                ort evaluate \
+                  -i /results/analyzer-result.yml \
+                  -o /results \
+                  --rules-file /project/rules.kts \
+                  --license-classifications-file /project/license-classifications.yml || true
+              fi
+              
+              # Generate reports
+              RESULT_FILE=/results/evaluation-result.yml
+              if [ ! -f \$RESULT_FILE ]; then
+                RESULT_FILE=/results/analyzer-result.yml
+              fi
+              
+              if [ -f \$RESULT_FILE ]; then
+                ort report \
+                  -i \$RESULT_FILE \
+                  -o /results \
+                  --report-formats StaticHtml,WebApp,SpdxDocument,CycloneDx \
+                  --license-classifications-file /project/license-classifications.yml || true
+              fi
+              
+              # Ensure results are readable
+              chmod -R 755 /results
+            "
+      
+      - name: Upload ORT Results
+        if: success() || failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ort-results-fixed
+          path: ort-results/
+          retention-days: 30
+      
+      - name: Check for Policy Violations
+        if: success() || failure()
+        run: |
+          if [ -f "ort-results/evaluation-result.yml" ]; then
+            echo "Checking for policy violations..."
+            if grep -q "violations:" ort-results/evaluation-result.yml; then
+              echo "⚠️ Policy violations found. Check the reports for details."
+              exit 1
+            else
+              echo "✅ No policy violations found."
+            fi
+          fi

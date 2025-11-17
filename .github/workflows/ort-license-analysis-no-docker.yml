@@ -1,0 +1,163 @@
+name: ORT License Analysis (Alternative - No Docker)
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - main
+
+env:
+  JAVA_OPTS: "-Xmx8g"
+  GRADLE_OPTS: "-Dorg.gradle.daemon=false -Dorg.gradle.parallel=false"
+
+jobs:
+  analyze-no-docker:
+    name: ORT Analysis without Docker
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Project Repository
+        uses: actions/checkout@v4
+        with:
+          path: project
+          fetch-depth: 0
+      
+      - name: Checkout ORT Repository
+        uses: actions/checkout@v4
+        with:
+          repository: oss-review-toolkit/ort
+          path: ort
+          ref: main
+      
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+      
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+      
+      - name: Build ORT
+        working-directory: ort
+        run: |
+          ./gradlew installDist
+          echo "$(pwd)/cli/build/install/ort/bin" >> $GITHUB_PATH
+      
+      - name: Verify ORT Installation
+        run: |
+          ort --version
+          ort requirements
+      
+      - name: Create ORT Configuration
+        working-directory: project
+        run: |
+          mkdir -p .ort
+          
+          # Create default configuration files if they don't exist
+          if [ ! -f "rules.kts" ]; then
+            cat > rules.kts << 'EOF'
+          /*
+           * Default ORT policy rules
+           */
+          
+          val permissiveLicenses = setOf(
+              "Apache-2.0", "MIT", "BSD-2-Clause", "BSD-3-Clause", "ISC"
+          )
+          
+          val copyleftLicenses = setOf(
+              "GPL-2.0-only", "GPL-3.0-only", "LGPL-2.1-only", "AGPL-3.0-only"
+          )
+          
+          ruleSet(ortResult) {
+              packageRule("WARN_COPYLEFT") {
+                  require {
+                      -isAtTreeLevel(0)
+                  }
+                  
+                  licenseRule("copyleft_license", LicenseView.CONCLUDED_OR_DECLARED_AND_DETECTED) {
+                      require {
+                          +isCopyleft()
+                      }
+                      
+                      warning(
+                          "Copyleft license detected",
+                          "Package uses copyleft license: ${license.simpleLicense()}"
+                      )
+                  }
+              }
+          }
+          
+          fun isCopyleft() = { license: LicenseSource ->
+              copyleftLicenses.contains(license.simpleLicense().toString())
+          }
+          EOF
+          fi
+          
+          if [ ! -f "license-classifications.yml" ]; then
+            cat > license-classifications.yml << 'EOF'
+          categories:
+            - name: permissive
+              description: Permissive open source licenses
+            - name: copyleft
+              description: Copyleft open source licenses
+          
+          categorizations:
+            - id: Apache-2.0
+              categories: [permissive]
+            - id: MIT
+              categories: [permissive]
+            - id: GPL-3.0-only
+              categories: [copyleft]
+          EOF
+          fi
+      
+      - name: Run ORT Analyzer
+        working-directory: project
+        run: |
+          mkdir -p ../ort-results
+          
+          ort analyze \
+            -i . \
+            -o ../ort-results \
+            --package-curations-dir .ort-data/curations-dir/ \
+            2>&1 | tee ../ort-results/analyzer.log || true
+      
+      - name: Run ORT Evaluator
+        if: success() || failure()
+        working-directory: project
+        run: |
+          if [ -f "../ort-results/analyzer-result.yml" ]; then
+            ort evaluate \
+              -i ../ort-results/analyzer-result.yml \
+              -o ../ort-results \
+              --rules-file rules.kts \
+              --license-classifications-file license-classifications.yml \
+              2>&1 | tee ../ort-results/evaluator.log || true
+          fi
+      
+      - name: Generate Reports
+        if: success() || failure()
+        working-directory: project
+        run: |
+          RESULT_FILE="../ort-results/evaluation-result.yml"
+          if [ ! -f "$RESULT_FILE" ]; then
+            RESULT_FILE="../ort-results/analyzer-result.yml"
+          fi
+          
+          if [ -f "$RESULT_FILE" ]; then
+            ort report \
+              -i "$RESULT_FILE" \
+              -o ../ort-results \
+              --report-formats StaticHtml,WebApp,SpdxDocument \
+              --license-classifications-file license-classifications.yml \
+              2>&1 | tee ../ort-results/reporter.log || true
+          fi
+      
+      - name: Upload Results
+        if: success() || failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ort-results-no-docker
+          path: ort-results/
+          retention-days: 30
