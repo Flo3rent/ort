@@ -1,4 +1,4 @@
-name: ORT License Analysis
+name: ort-test
 
 on:
   workflow_dispatch:
