@@ -1,197 +1,66 @@
-name: ort-test
+name: ORT License Analysis 1.1
 
 on:
   workflow_dispatch:
+    inputs:
+      analyze:
+        description: 'Set to false to disable the execution of the ORT analyze ORT Action'
+        required: false
+        default: 'true'
+      evaluate:
+        description: 'Set to false to disable the execution of the ORT evaluate ORT Action'
+        required: false
+        default: 'true'
+      report:
+        description: 'Set to false to disable the execution of the ORT report ORT Action'
+        required: false
+        default: 'true'
   # pull_request:
-  #   branches:
-  #     - main
   # push:
   #   branches:
-  #     - main
+  #     - '*'
 
 env:
-  # Configure ORT to use 8GB of memory
   JAVA_OPTS: "-Xmx8g"
 
 jobs:
   analyze:
     name: ORT License Analysis
     runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/oss-review-toolkit/ort:29.0.0
+      options: --user root
     
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # Full history for accurate VCS info
+          fetch-depth: 0
       
-      - name: Setup Java
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'temurin'
-          java-version: '21'  # ORT now uses Java 21
-
-      - name: Create default configuration files
+      - name: Create ORT Configuration
         run: |
-          if [ ! -f "license-classifications.yml" ]; then
-            echo "Creating default license-classifications.yml"
-            cat > license-classifications.yml << 'EOF'
-          categories:
-            - name: permissive
-              description: Permissive licenses with minimal restrictions
-            - name: weak-copyleft
-              description: Weak copyleft licenses (e.g., LGPL, MPL)
-            - name: strong-copyleft
-              description: Strong copyleft licenses (e.g., GPL, AGPL)
-            - name: public-domain
-              description: Public domain and equivalent licenses
-            - name: proprietary
-              description: Proprietary or commercial licenses
-          
-          categorizations:
-            - id: Apache-2.0
-              categories: [permissive]
-            - id: MIT
-              categories: [permissive]
-            - id: BSD-2-Clause
-              categories: [permissive]
-            - id: BSD-3-Clause
-              categories: [permissive]
-            - id: ISC
-              categories: [permissive]
-            - id: LGPL-2.1-only
-              categories: [weak-copyleft]
-            - id: LGPL-3.0-only
-              categories: [weak-copyleft]
-            - id: MPL-2.0
-              categories: [weak-copyleft]
-            - id: GPL-2.0-only
-              categories: [strong-copyleft]
-            - id: GPL-3.0-only
-              categories: [strong-copyleft]
-            - id: AGPL-3.0-only
-              categories: [strong-copyleft]
-            - id: CC0-1.0
-              categories: [public-domain]
-            - id: Unlicense
-              categories: [public-domain]
+          mkdir -p .ort
+          cat > .ort.yml << 'EOF'
+          analyzer:
+            allow_dynamic_versions: true
           EOF
-          fi
       
-      # Solution 1: Use official ORT Docker image with proper permissions
-      - name: Run ORT Analysis with Docker
+      - name: Run ORT Analyze
+        if: ${{ github.event.inputs.analyze != 'false' }}
         run: |
-          # Create output and cache directories
-          mkdir -p ort-results .ort-home
-          
-          # Run ORT using official Docker image from ghcr.io
-          # Run as current user to have write permissions and map a home directory
-          docker run --rm \
-            --user $(id -u):$(id -g) \
-            -v "$(pwd)/.ort-home:/home/runner" \
-            -e HOME=/home/runner \
-            -v "$(pwd):/project" \
-            -v "$(pwd)/ort-results:/results" \
-            -e JAVA_OPTS="${JAVA_OPTS}" \
-            ghcr.io/oss-review-toolkit/ort:latest \
-            analyze \
-              -i /project \
-              -o /results \
-              || true  # Continue on error to preserve partial results
+          ort analyze -i . -o ort-results
       
-      - name: Run ORT Scan (Optional)
-        if: success() || failure()
+      - name: Run ORT Evaluate
+        if: ${{ github.event.inputs.evaluate != 'false' }}
         run: |
-          docker run --rm \
-            --user $(id -u):$(id -g) \
-            -v "$(pwd)/.ort-home:/home/runner" \
-            -e HOME=/home/runner \
-            -v "$(pwd):/project" \
-            -v "$(pwd)/ort-results:/results" \
-            -e JAVA_OPTS="${JAVA_OPTS}" \
-            ghcr.io/oss-review-toolkit/ort:latest \
-            scan \
-              -i /results/analyzer-result.yml \
-              -o /results \
-              || true
+          ort evaluate -i ort-results/analyzer-result.yml -o ort-results
+        continue-on-error: true
       
-      - name: Run ORT Evaluator
-        if: success() || failure()
+      - name: Run ORT Report
+        if: ${{ github.event.inputs.report != 'false' }}
         run: |
-          # Create rules file if it doesn't exist
-          if [ ! -f "rules.kts" ]; then
-            echo "Creating default rules.kts"
-            cat > rules.kts << 'EOF'
-          /*
-           * Example ORT policy rules
-           */
-          
-          // Define license categories
-          val permissiveLicenses = listOf(
-              "Apache-2.0", "MIT", "BSD-2-Clause", "BSD-3-Clause", 
-              "ISC", "Unlicense", "0BSD"
-          )
-          
-          val copyleftLicenses = listOf(
-              "GPL-2.0-only", "GPL-3.0-only", "LGPL-2.1-only", 
-              "LGPL-3.0-only", "AGPL-3.0-only", "MPL-2.0"
-          )
-          
-          // Rule: Deny copyleft licenses
-          ruleSet(ortResult) {
-              packageRule("DENY_COPYLEFT") {
-                  require {
-                      -isAtTreeLevel(0) // Only check dependencies, not the project itself
-                      +isCopyleft()
-                  }
-                  
-                  error(
-                      "Package uses copyleft license",
-                      "The package '${pkg.id.toCoordinates()}' uses the copyleft license(s): " +
-                      "${pkg.concludedLicense ?: pkg.declaredLicenses}"
-                  )
-              }
-          }
-          
-          fun isCopyleft() = { pkg: Package ->
-              copyleftLicenses.any { license ->
-                  pkg.concludedLicense?.toString()?.contains(license) == true ||
-                  pkg.declaredLicenses.any { it.contains(license) }
-              }
-          }
-          EOF
-          fi
-          
-          docker run --rm \
-            --user $(id -u):$(id -g) \
-            -v "$(pwd)/.ort-home:/home/runner" \
-            -e HOME=/home/runner \
-            -v "$(pwd):/project" \
-            -v "$(pwd)/ort-results:/results" \
-            -e JAVA_OPTS="${JAVA_OPTS}" \
-            ghcr.io/oss-review-toolkit/ort:latest \
-            evaluate \
-              -i /results/analyzer-result.yml \
-              -o /results \
-              --rules-file /project/rules.kts \
-              --license-classifications-file /project/license-classifications.yml \
-              || true
-      
-      - name: Generate ORT Reports
-        if: success() || failure()
-        run: |
-          docker run --rm \
-            --user $(id -u):$(id -g) \
-            -v "$(pwd)/.ort-home:/home/runner" \
-            -e HOME=/home/runner \
-            -v "$(pwd):/project" \
-            -v "$(pwd)/ort-results:/results" \
-            -e JAVA_OPTS="${JAVA_OPTS}" \
-            ghcr.io/oss-review-toolkit/ort:latest \
-            report \
-              -i /results/evaluation-result.yml \
-              -o /results \
-              --report-formats StaticHtml,WebApp,SpdxDocument,CycloneDx \
-              || true
+          ort report -i ort-results/evaluation-result.yml -o ort-results -f StaticHtml,WebApp
+        continue-on-error: true
       
       - name: Upload ORT Results
         if: always()
@@ -200,13 +69,4 @@ jobs:
           name: ort-results
           path: ort-results/
           retention-days: 30
-          if-no-files-found: ignore
-      
-      - name: Upload HTML Report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: ort-html-report
-          path: ort-results/*-web-app.html
-          retention-days: 90
           if-no-files-found: ignore
